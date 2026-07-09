@@ -1,0 +1,293 @@
+"""CalculiX .inp 文件生成器
+
+将结构模型（节点、单元、材料、边界条件）输出为 CalculiX 输入文件。
+用户不写任何矩阵公式——只描述物理模型，CalculiX 自动完成 K/M 组装和求解。
+
+支持的 CalculiX 元素:
+  B32 — 3节点 Timoshenko 梁（碳管）
+  S4/S4R — 4节点壳（3D打印件）
+  MASS — 集中质量（电机/电池/飞控）
+  SPRING2 — 两节点弹簧（绑带）
+
+参考: CalculiX 2.21 User's Manual
+"""
+
+from dataclasses import dataclass, field
+from typing import Optional
+import numpy as np
+from pathlib import Path
+
+from ..materials import Material
+
+
+@dataclass
+class NodeSet:
+    """节点组"""
+    name: str
+    node_ids: list[int] = field(default_factory=list)
+
+
+@dataclass
+class BeamSet:
+    """梁单元组 (B32)"""
+    name: str
+    material: str           # 材料名
+    section_type: str = "RECT"  # RECT, BOX, PIPE, GENERIC
+    section_params: tuple = (0.01, 0.01)  # (a, b) for RECT
+    orientation: tuple = (0.0, 1.0, 0.0)  # 截面 y 方向
+    elements: list[tuple[int, int, int, int]] = field(default_factory=list)
+    # (elem_id, n1, n2, n3) — B32 是3节点梁
+
+
+@dataclass
+class ShellSet:
+    """壳单元组 (S3/S3R/S4/S4R)
+
+    S3  (3节点三角形壳):  elements 中每项为 (eid, n1, n2, n3)
+    S4  (4节点四边形壳):  elements 中每项为 (eid, n1, n2, n3, n4)
+    """
+    name: str
+    material: str
+    thickness: float
+    elem_type: str = "S4"   # "S3", "S3R", "S4", "S4R"
+    elements: list = field(default_factory=list)
+
+
+@dataclass
+class SolidSet:
+    """实体单元组 (C3D4/C3D8/C3D10)
+
+    C3D4  (4节点四面体):  elements 中每项为 (eid, n1, n2, n3, n4)
+    C3D8  (8节点六面体):  elements 中每项为 (eid, n1, ..., n8)
+    C3D10 (10节点四面体): elements 中每项为 (eid, n1, ..., n10)
+    """
+    name: str
+    material: str
+    elem_type: str = "C3D8"
+    elements: list = field(default_factory=list)
+
+
+@dataclass
+class MassElement:
+    """集中质量"""
+    node_id: int
+    mass: float  # kg
+
+
+@dataclass
+class SpringElement:
+    """两节点弹簧"""
+    elem_id: int
+    n1: int
+    n2: int
+    k: float  # N/m
+
+
+class InpGenerator:
+    """CalculiX .inp 生成器
+
+    使用方式:
+        gen = InpGenerator("model_name")
+        gen.add_material("Steel", E=200e9, nu=0.3, rho=7850)
+        gen.add_nodes([[0,0,0], [1,0,0], ...])
+        gen.add_boundary(1, 1, 6)  # 固定节点1的DOF 1-6
+        gen.add_frequency_step(10)  # 求10阶模态
+        gen.write("output.inp")
+    """
+
+    def __init__(self, name: str = "model"):
+        self.name = name
+        self._nodes: list[tuple[float, float, float]] = []
+        self._materials: dict[str, Material] = {}
+        self._beam_sets: list[BeamSet] = []
+        self._shell_sets: list[ShellSet] = []
+        self._solid_sets: list[SolidSet] = []
+        self._mass_elements: list[MassElement] = []
+        self._spring_elements: list[SpringElement] = []
+        self._boundaries: list[tuple[int, int, int]] = []  # (node, dof1, dof2)
+        self._n_modes: int = 10
+        self._node_sets: list[NodeSet] = []
+
+    # ============================================================
+    # 模型定义 API
+    # ============================================================
+
+    def add_material(self, name: str, material: Material):
+        """添加材料"""
+        self._materials[name] = material
+
+    def add_nodes(self, coords: np.ndarray | list):
+        """批量添加节点
+
+        Parameters
+        ----------
+        coords : (N, 3) 节点坐标数组
+        """
+        coords = np.asarray(coords)
+        for i in range(coords.shape[0]):
+            self._nodes.append(tuple(coords[i]))
+        return len(self._nodes)  # 返回最后一个节点 ID
+
+    def add_node(self, x: float, y: float, z: float) -> int:
+        """添加单个节点，返回节点 ID (1-based)"""
+        self._nodes.append((x, y, z))
+        return len(self._nodes)
+
+    def add_beam_elements(self, beam_set: BeamSet):
+        """添加梁单元组"""
+        self._beam_sets.append(beam_set)
+
+    def add_shell_elements(self, shell_set: ShellSet):
+        """添加壳单元组"""
+        self._shell_sets.append(shell_set)
+
+    def add_solid_elements(self, solid_set: SolidSet):
+        """添加实体单元组 (C3D4/C3D8/C3D10)"""
+        self._solid_sets.append(solid_set)
+
+    def add_mass(self, node_id: int, mass: float):
+        """添加集中质量"""
+        self._mass_elements.append(MassElement(node_id, mass))
+
+    def add_spring(self, elem_id: int, n1: int, n2: int, k: float):
+        """添加弹簧单元"""
+        self._spring_elements.append(SpringElement(elem_id, n1, n2, k))
+
+    def add_boundary(self, node_id: int, dof_start: int, dof_end: int):
+        """约束节点 DOF: 1=ux, 2=uy, 3=uz, 4=rx, 5=ry, 6=rz"""
+        self._boundaries.append((node_id, dof_start, dof_end))
+
+    def add_node_set(self, name: str, node_ids: list[int]):
+        """定义节点集合"""
+        self._node_sets.append(NodeSet(name, node_ids))
+
+    def add_frequency_step(self, n_modes: int = 10):
+        """添加频率分析步"""
+        self._n_modes = n_modes
+
+    # ============================================================
+    # .inp 输出
+    # ============================================================
+
+    def generate(self) -> str:
+        """生成完整 .inp 内容"""
+        lines = [f"** {self.name}"]
+        lines.append(f"** Generated by drone_fem InpGenerator")
+        lines.append(f"** Nodes: {len(self._nodes)}, "
+                     f"Beam sets: {len(self._beam_sets)}, "
+                     f"Shell sets: {len(self._shell_sets)}, "
+                     f"Solid sets: {len(self._solid_sets)}")
+        lines.append("")
+
+        # ---- 节点 ----
+        lines.append("*NODE")
+        for i, (x, y, z) in enumerate(self._nodes):
+            lines.append(f"{i+1}, {x:.8f}, {y:.8f}, {z:.8f}")
+        lines.append("")
+
+        # ---- 梁单元 ----
+        for bs in self._beam_sets:
+            lines.append(f"*ELEMENT, TYPE=B32, ELSET={bs.name}")
+            for elem_id, n1, n2, n3 in bs.elements:
+                lines.append(f"{elem_id}, {n1}, {n2}, {n3}")
+            lines.append("")
+
+        # ---- 壳单元 ----
+        for ss in self._shell_sets:
+            lines.append(f"*ELEMENT, TYPE={ss.elem_type}, ELSET={ss.name}")
+            for elem in ss.elements:
+                lines.append(", ".join(str(n) for n in elem))
+            lines.append("")
+
+        # ---- 实体单元 ----
+        for so in self._solid_sets:
+            lines.append(f"*ELEMENT, TYPE={so.elem_type}, ELSET={so.name}")
+            for elem in so.elements:
+                lines.append(", ".join(str(n) for n in elem))
+            lines.append("")
+
+        # ---- 弹簧单元 ----
+        if self._spring_elements:
+            lines.append("*ELEMENT, TYPE=SPRING2, ELSET=Springs")
+            for sp in self._spring_elements:
+                lines.append(f"{sp.elem_id}, {sp.n1}, {sp.n2}")
+            lines.append("*SPRING, ELSET=Springs")
+            for sp in self._spring_elements:
+                lines.append(f"{sp.k:.6e}")
+            lines.append("")
+
+        # ---- 梁截面 ----
+        for bs in self._beam_sets:
+            stype = bs.section_type
+            params = ",".join(f"{p:.6f}" for p in bs.section_params)
+            orient = ",".join(f"{v:.6f}" for v in bs.orientation)
+            lines.append(f"*BEAM SECTION, ELSET={bs.name}, "
+                         f"MATERIAL={bs.material}, SECTION={stype}")
+            lines.append(params)
+            lines.append(orient)
+            lines.append("")
+
+        # ---- 壳截面 ----
+        for ss in self._shell_sets:
+            lines.append(f"*SHELL SECTION, ELSET={ss.name}, "
+                         f"MATERIAL={ss.material}")
+            lines.append(f"{ss.thickness:.8f}")
+            lines.append("")
+
+        # ---- 实体截面 ----
+        for so in self._solid_sets:
+            lines.append(f"*SOLID SECTION, ELSET={so.name}, "
+                         f"MATERIAL={so.material}")
+            lines.append("")
+
+        # ---- 材料 ----
+        for name, mat in self._materials.items():
+            lines.append(f"*MATERIAL, NAME={name}")
+            lines.append(f"*ELASTIC")
+            lines.append(f"{mat.E:.6e}, {mat.nu:.6f}")
+            lines.append(f"*DENSITY")
+            lines.append(f"{mat.rho:.6e}")
+            lines.append("")
+
+        # ---- 集中质量 ----
+        if self._mass_elements:
+            lines.append("*MASS, ELSET=PointMasses")
+            for m in self._mass_elements:
+                lines.append(f"{m.node_id}, {m.mass:.6f}")
+            lines.append("")
+
+        # ---- 节点组 ----
+        for ns in self._node_sets:
+            ids = ns.node_ids
+            lines.append(f"*NSET, NSET={ns.name}")
+            for chunk in _chunk_list(ids, 16):
+                lines.append(",".join(str(i) for i in chunk))
+            lines.append("")
+
+        # ---- 边界条件 ----
+        for node, d1, d2 in self._boundaries:
+            lines.append(f"*BOUNDARY")
+            lines.append(f"{node}, {d1}, {d2}")
+        lines.append("")
+
+        # ---- 频率分析步 ----
+        lines.append("*STEP")
+        lines.append("*FREQUENCY")
+        lines.append(str(self._n_modes))
+        lines.append("*NODE FILE")
+        lines.append("U")
+        lines.append("*END STEP")
+
+        return "\n".join(lines)
+
+    def write(self, path: str | Path):
+        """写入 .inp 文件"""
+        content = self.generate()
+        Path(path).write_text(content)
+        return path
+
+
+def _chunk_list(lst: list, n: int):
+    """将列表切分为每块最多 n 个元素的块 (CalculiX 每行最多16项)"""
+    for i in range(0, len(lst), n):
+        yield lst[i:i + n]
