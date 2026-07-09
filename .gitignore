@@ -1,0 +1,52 @@
+# ===== Claude =====
+.claude/
+
+# ===== PDF =====
+*.pdf
+
+# ===== Python =====
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+dist/
+build/
+*.egg
+.eggs/
+*.whl
+
+# Virtual environments
+venv/
+.venv/
+env/
+.env/
+
+# ===== IDE / Editor =====
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.project
+.pydevproject
+.settings/
+
+# ===== OS =====
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# ===== Calculix / FEM =====
+*.frd
+*.dat
+*.msg
+*.sta
+*.cvg
+*.12d
+*.f06
+*.op2
+
+# ===== Misc =====
+*.log
+*.tmp
+*.bak
